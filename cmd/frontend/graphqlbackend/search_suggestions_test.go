@@ -20,7 +20,7 @@ func TestSearchSuggestions(t *testing.T) {
 
 	createSearchResolver := func(t *testing.T, query string) *searchResolver {
 		t.Helper()
-		r, err := (&schemaResolver{}).Search(&struct{ Query string }{Query: query})
+		r, err := (&schemaResolver{}).SearchOld(&struct{ Query string }{Query: query})
 		if err != nil {
 			t.Fatal("Search:", err)
 		}

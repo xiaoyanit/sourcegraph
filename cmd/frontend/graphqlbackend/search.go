@@ -49,6 +49,12 @@ func maxReposToSearch() int {
 // Search provides search results and suggestions.
 func (r *schemaResolver) Search(args *struct {
 	Query string
+}) (*searcherResolver, error) {
+	return newSearcherResolver(args.Query)
+}
+
+func (r *schemaResolver) SearchOld(args *struct {
+	Query string
 }) (*searchResolver, error) {
 	query, err := query.ParseAndCheck(args.Query)
 	if err != nil {

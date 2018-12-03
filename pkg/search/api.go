@@ -192,3 +192,10 @@ type Options struct {
 func (s *Options) String() string {
 	return fmt.Sprintf("%#v", s)
 }
+
+// ShallowCopy returns a shallow copy of Options. Note: That means
+// Repositories slice is the same underlying array.
+func (s *Options) ShallowCopy() *Options {
+	o := *s
+	return &o
+}
