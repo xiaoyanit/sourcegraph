@@ -2,9 +2,11 @@ package graphqlbackend
 
 import (
 	"context"
-	"errors"
+	"sync"
+	"time"
 	"unicode/utf8"
 
+	"github.com/pkg/errors"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/db"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
 	"github.com/sourcegraph/sourcegraph/pkg/api"
@@ -48,9 +50,12 @@ func newSearcherResolver(qStr string) (*searcherResolver, error) {
 }
 
 func (r *searcherResolver) Results(ctx context.Context) (*searchResultsResolver, error) {
+	start := time.Now()
+
 	// 1. Scope the request to repositories
 	opts := r.Options.ShallowCopy()
 	opts.Repositories = []search.Repository{{Name: "github.com/sourcegraph/go-langserver", Commit: "1fe24b2b3fd1f420474fb872d944d2a1a93ddf63"}}
+	sCtx := &searchContext{}
 
 	// 2. Do the search
 	result, err := r.Searcher.Search(ctx, r.Q, opts)
@@ -61,7 +66,19 @@ func (r *searcherResolver) Results(ctx context.Context) (*searchResultsResolver,
 	// 3. To ship hierarchical search sooner we are using the old file match
 	//    resolver. However, we should just be returning a resolver which is a
 	//    light wrapper around a search.Result.
-	return &searchResultsResolver{results: toSearchResultResolvers(result)}, nil
+	results, err := toSearchResultResolvers(ctx, sCtx, result)
+	if err != nil {
+		return nil, err
+	}
+	common, err := toSearchResultsCommon(ctx, sCtx, opts, result)
+	if err != nil {
+		return nil, err
+	}
+	return &searchResultsResolver{
+		results:             results,
+		searchResultsCommon: *common,
+		start:               start,
+	}, nil
 }
 
 func (r *searcherResolver) Suggestions(ctx context.Context, args *searchSuggestionsArgs) ([]*searchSuggestionResolver, error) {
@@ -72,10 +89,8 @@ func (r *searcherResolver) Stats(ctx context.Context) (stats *searchResultsStats
 	return nil, errors.New("search stats not implemented")
 }
 
-func toSearchResultResolvers(r *search.Result) []*searchResultResolver {
+func toSearchResultResolvers(ctx context.Context, sCtx *searchContext, r *search.Result) ([]*searchResultResolver, error) {
 	results := make([]*searchResultResolver, 0, len(r.Files))
-
-	repos := map[api.RepoName]*types.Repo{}
 
 	for _, file := range r.Files {
 		fileLimitHit := false
@@ -94,16 +109,9 @@ func toSearchResultResolvers(r *search.Result) []*searchResultResolver {
 			})
 		}
 
-		// TODO some sort of helper which looks up based on previously looked up repos.
-		repo, ok := repos[file.Repository.Name]
-		if !ok {
-			var err error
-			repo, err = db.Repos.GetByName(context.TODO(), file.Repository.Name)
-			if err != nil {
-				log15.Error("failed to get repo", "repo", file.Repository, "error", err)
-				continue
-			}
-			repos[file.Repository.Name] = repo
+		repo, err := sCtx.GetRepo(ctx, file.Repository.Name)
+		if err != nil {
+			return nil, err
 		}
 
 		results = append(results, &searchResultResolver{
@@ -118,5 +126,118 @@ func toSearchResultResolvers(r *search.Result) []*searchResultResolver {
 		})
 	}
 
-	return results
+	return results, nil
+}
+
+func toSearchResultsCommon(ctx context.Context, sCtx *searchContext, opts *search.Options, r *search.Result) (*searchResultsCommon, error) {
+	var (
+		repos    = map[api.RepoName]struct{}{}
+		searched = map[api.RepoName]struct{}{}
+		indexed  = map[api.RepoName]struct{}{}
+		cloning  = map[api.RepoName]struct{}{}
+		missing  = map[api.RepoName]struct{}{}
+		partial  = map[api.RepoName]struct{}{}
+		timedout = map[api.RepoName]struct{}{}
+	)
+	for _, s := range r.Stats.Status {
+		repos[s.Repository.Name] = struct{}{}
+		if s.Source == backend.SourceZoekt {
+			indexed[s.Repository.Name] = struct{}{}
+		}
+
+		switch s.Status {
+		case search.RepositoryStatusSearched:
+			searched[s.Repository.Name] = struct{}{}
+
+		case search.RepositoryStatusLimitHit:
+			searched[s.Repository.Name] = struct{}{}
+			partial[s.Repository.Name] = struct{}{}
+
+		case search.RepositoryStatusTimedOut:
+			timedout[s.Repository.Name] = struct{}{}
+
+		case search.RepositoryStatusCloning:
+			cloning[s.Repository.Name] = struct{}{}
+
+		case search.RepositoryStatusMissing:
+			missing[s.Repository.Name] = struct{}{}
+
+		case search.RepositoryStatusError:
+			return nil, errors.Errorf("error repository status: %v", s)
+
+		default:
+			return nil, errors.Errorf("unknown repository status: %v", s)
+		}
+	}
+
+	unavailable := map[search.Source]bool{}
+	for _, u := range r.Stats.Unavailable {
+		unavailable[u] = true
+	}
+
+	var retErr error
+	list := func(m map[api.RepoName]struct{}) []*types.Repo {
+		repos := make([]*types.Repo, 0, len(m))
+		for name := range m {
+			repo, err := sCtx.GetRepo(ctx, name)
+			if err != nil {
+				retErr = err
+				continue
+			}
+			repos = append(repos, repo)
+		}
+		return repos
+	}
+
+	common := &searchResultsCommon{
+		maxResultsCount:  int32(opts.TotalMaxMatchCount),
+		resultCount:      int32(r.Stats.MatchCount),
+		indexUnavailable: unavailable[backend.SourceZoekt],
+
+		searched: list(searched),
+		indexed:  list(indexed),
+		cloning:  list(cloning),
+		missing:  list(missing),
+		timedout: list(timedout),
+		partial:  partial,
+	}
+	if retErr != nil {
+		return nil, retErr
+	}
+	return common, nil
+}
+
+// searchContext is used to reduce duplicate DB and gitserver calls.
+type searchContext struct {
+	mu    sync.Mutex
+	repos map[api.RepoName]*types.Repo
+}
+
+func (s *searchContext) GetRepo(ctx context.Context, name api.RepoName) (*types.Repo, error) {
+	s.mu.Lock()
+	if s.repos == nil {
+		s.repos = map[api.RepoName]*types.Repo{}
+	}
+	r, ok := s.repos[name]
+	s.mu.Unlock()
+	if ok {
+		return r, nil
+	}
+	r, err := db.Repos.GetByName(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	s.CacheRepo(r)
+	return r, nil
+}
+
+func (s *searchContext) CacheRepo(repos ...*types.Repo) {
+	s.mu.Lock()
+	if s.repos == nil {
+		s.repos = map[api.RepoName]*types.Repo{}
+	}
+	for _, r := range repos {
+		s.repos[r.Name] = r
+	}
+	s.mu.Unlock()
 }
