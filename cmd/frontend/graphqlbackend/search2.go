@@ -7,12 +7,16 @@ import (
 	"unicode/utf8"
 
 	"github.com/pkg/errors"
+	sgbackend "github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/db"
+	frontendsearch "github.com/sourcegraph/sourcegraph/cmd/frontend/internal/pkg/search"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
 	"github.com/sourcegraph/sourcegraph/pkg/api"
+	"github.com/sourcegraph/sourcegraph/pkg/gitserver"
 	"github.com/sourcegraph/sourcegraph/pkg/search"
 	"github.com/sourcegraph/sourcegraph/pkg/search/backend"
 	"github.com/sourcegraph/sourcegraph/pkg/search/query"
+	"github.com/sourcegraph/sourcegraph/pkg/vcs/git"
 	log15 "gopkg.in/inconshreveable/log15.v2"
 )
 
@@ -33,15 +37,22 @@ func newSearcherResolver(qStr string) (*searcherResolver, error) {
 		return nil, err
 	}
 	return &searcherResolver{
-		Searcher: &backend.Mock{
-			Result: &search.Result{
-				Files: []search.FileMatch{{
-					Path: "README.md",
-					Repository: search.Repository{
-						Name:   "github.com/sourcegraph/go-langserver",
-						Commit: "1fe24b2b3fd1f420474fb872d944d2a1a93ddf63",
-					},
-				}},
+		Searcher: &backend.Text{
+			Index: &backend.Zoekt{
+				// TODO this can be nil
+				Client: zoektCl,
+			},
+			Fallback: &backend.TextJIT{
+				// TODO this can be nil
+				Endpoints: searcherURLs,
+				Resolve: func(ctx context.Context, name api.RepoName, spec string) (api.CommitID, error) {
+					// Do not trigger a repo-updater lookup (e.g.,
+					// backend.{GitRepo,Repos.ResolveRev}) because that would
+					// slow this operation down by a lot (if we're looping
+					// over many repos). This means that it'll fail if a repo
+					// is not on gitserver.
+					return git.ResolveRevision(ctx, gitserver.Repo{Name: name}, nil, spec, nil)
+				},
 			},
 		},
 		Q:       q,
@@ -50,12 +61,30 @@ func newSearcherResolver(qStr string) (*searcherResolver, error) {
 }
 
 func (r *searcherResolver) Results(ctx context.Context) (*searchResultsResolver, error) {
+	sCtx := &searchContext{}
 	start := time.Now()
 
 	// 1. Scope the request to repositories
+	dbQ, err := frontendsearch.RepoQuery(r.Q)
+	if err != nil {
+		return nil, err
+	}
+	maxRepoListSize := maxReposToSearch()
+	repos, err := sgbackend.Repos.List(ctx, db.ReposListOptions{
+		Enabled:      true,
+		PatternQuery: dbQ,
+		LimitOffset:  &db.LimitOffset{Limit: maxRepoListSize + 1}, // TODO check if we hit repo list size limit
+		// TODO forks and archived
+	})
+	if err != nil {
+		return nil, err
+	}
+	sCtx.CacheRepo(repos...)
 	opts := r.Options.ShallowCopy()
-	opts.Repositories = []search.Repository{{Name: "github.com/sourcegraph/go-langserver", Commit: "1fe24b2b3fd1f420474fb872d944d2a1a93ddf63"}}
-	sCtx := &searchContext{}
+	opts.Repositories = make([]api.RepoName, len(repos))
+	for i := range repos {
+		opts.Repositories[i] = repos[i].Name
+	}
 
 	// 2. Do the search
 	result, err := r.Searcher.Search(ctx, r.Q, opts)
