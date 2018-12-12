@@ -51,7 +51,7 @@ func newSearcherResolver(qStr string) (*searcherResolver, error) {
 					// slow this operation down by a lot (if we're looping
 					// over many repos). This means that it'll fail if a repo
 					// is not on gitserver.
-					return git.ResolveRevision(ctx, gitserver.Repo{Name: name}, nil, spec, nil)
+					return git.ResolveRevision(ctx, gitserver.Repo{Name: name}, nil, spec, &git.ResolveRevisionOptions{NoEnsureRevision: true})
 				},
 			},
 		},
