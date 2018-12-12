@@ -2,6 +2,7 @@ package graphqlbackend
 
 import (
 	"context"
+	"regexp"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -86,13 +87,19 @@ func (r *searcherResolver) Results(ctx context.Context) (*searchResultsResolver,
 		opts.Repositories[i] = repos[i].Name
 	}
 
-	// 2. Do the search
-	result, err := r.Searcher.Search(ctx, r.Q, opts)
+	// 3. Adjust query so repo: atoms become reposets:
+	q, err := query.ExpandRepo(r.Q, createListFunc(opts.Repositories))
 	if err != nil {
 		return nil, err
 	}
 
-	// 3. To ship hierarchical search sooner we are using the old file match
+	// 4. Do the search
+	result, err := r.Searcher.Search(ctx, q, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// 5. To ship hierarchical search sooner we are using the old file match
 	//    resolver. However, we should just be returning a resolver which is a
 	//    light wrapper around a search.Result.
 	results, err := toSearchResultResolvers(ctx, sCtx, result)
@@ -234,6 +241,54 @@ func toSearchResultsCommon(ctx context.Context, sCtx *searchContext, opts *searc
 		return nil, retErr
 	}
 	return common, nil
+}
+
+// createListFunc returns a list function for query.ExpandRepo based on
+// matching repo: atoms as regular expressions. See documentation for
+// query.ExpandRepo.
+func createListFunc(repos []api.RepoName) func([]string, []string) (map[string]struct{}, error) {
+	compile := func(ps []string) ([]*regexp.Regexp, error) {
+		res := make([]*regexp.Regexp, 0, len(ps))
+		for _, p := range ps {
+			re, err := regexp.Compile(p)
+			if err != nil {
+				return nil, err
+			}
+			res = append(res, re)
+		}
+		return res, nil
+	}
+	return func(inc, exc []string) (map[string]struct{}, error) {
+		incRes, err := compile(inc)
+		if err != nil {
+			return nil, err
+		}
+		excRes, err := compile(exc)
+		if err != nil {
+			return nil, err
+		}
+
+		set := map[string]struct{}{}
+		for _, r := range repos {
+			matched := true
+			for _, re := range incRes {
+				if !matched {
+					break
+				}
+				matched = matched && re.MatchString(string(r))
+			}
+			for _, re := range excRes {
+				if !matched {
+					break
+				}
+				matched = matched && !re.MatchString(string(r))
+			}
+			if matched {
+				set[string(r)] = struct{}{}
+			}
+		}
+		return set, nil
+	}
 }
 
 // searchContext is used to reduce duplicate DB and gitserver calls.
