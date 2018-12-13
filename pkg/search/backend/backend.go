@@ -89,7 +89,7 @@ func handleError(source search.Source, r search.Repository, err error) (*search.
 			status = search.RepositoryStatusMissing
 		}
 	} else if git.IsRevisionNotFound(err) {
-		status = search.RepositoryStatusMissing
+		status = search.RepositoryStatusCommitMissing
 	} else if errcode.IsNotFound(err) {
 		status = search.RepositoryStatusMissing
 	} else if errcode.IsTimeout(err) || errcode.IsTemporary(err) {

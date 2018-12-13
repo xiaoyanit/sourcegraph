@@ -2,17 +2,23 @@ package graphqlbackend
 
 import (
 	"context"
+	"fmt"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
+	zoektrpc "github.com/google/zoekt/rpc"
 	"github.com/pkg/errors"
 	sgbackend "github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/db"
 	frontendsearch "github.com/sourcegraph/sourcegraph/cmd/frontend/internal/pkg/search"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
 	"github.com/sourcegraph/sourcegraph/pkg/api"
+	"github.com/sourcegraph/sourcegraph/pkg/conf"
+	"github.com/sourcegraph/sourcegraph/pkg/endpoint"
+	"github.com/sourcegraph/sourcegraph/pkg/env"
 	"github.com/sourcegraph/sourcegraph/pkg/gitserver"
 	"github.com/sourcegraph/sourcegraph/pkg/search"
 	"github.com/sourcegraph/sourcegraph/pkg/search/backend"
@@ -38,26 +44,9 @@ func newSearcherResolver(qStr string) (*searcherResolver, error) {
 		return nil, err
 	}
 	return &searcherResolver{
-		Searcher: &backend.Text{
-			Index: &backend.Zoekt{
-				// TODO this can be nil
-				Client: zoektCl,
-			},
-			Fallback: &backend.TextJIT{
-				// TODO this can be nil
-				Endpoints: searcherURLs,
-				Resolve: func(ctx context.Context, name api.RepoName, spec string) (api.CommitID, error) {
-					// Do not trigger a repo-updater lookup (e.g.,
-					// backend.{GitRepo,Repos.ResolveRev}) because that would
-					// slow this operation down by a lot (if we're looping
-					// over many repos). This means that it'll fail if a repo
-					// is not on gitserver.
-					return git.ResolveRevision(ctx, gitserver.Repo{Name: name}, nil, spec, &git.ResolveRevisionOptions{NoEnsureRevision: true})
-				},
-			},
-		},
-		Q:       q,
-		Options: &search.Options{},
+		Searcher: Search().Text,
+		Q:        q,
+		Options:  &search.Options{},
 	}, nil
 }
 
@@ -114,6 +103,7 @@ func (r *searcherResolver) Results(ctx context.Context) (*searchResultsResolver,
 		results:             results,
 		searchResultsCommon: *common,
 		start:               start,
+		alert:               toSearchAlert(result),
 	}, nil
 }
 
@@ -198,6 +188,9 @@ func toSearchResultsCommon(ctx context.Context, sCtx *searchContext, opts *searc
 		case search.RepositoryStatusMissing:
 			missing[s.Repository.Name] = struct{}{}
 
+		case search.RepositoryStatusCommitMissing:
+			// Handled in toSearchAlert
+
 		case search.RepositoryStatusError:
 			return nil, errors.Errorf("error repository status: %v", s)
 
@@ -241,6 +234,43 @@ func toSearchResultsCommon(ctx context.Context, sCtx *searchContext, opts *searc
 		return nil, retErr
 	}
 	return common, nil
+}
+
+func toSearchAlert(r *search.Result) *searchAlert {
+	missing := map[api.RepoName][]string{}
+	for _, s := range r.Stats.Status {
+		if s.Status != search.RepositoryStatusCommitMissing {
+			continue
+		}
+		missing[s.Repository.Name] = append(missing[s.Repository.Name], s.Repository.RefPattern)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	var description string
+	if len(missing) == 1 {
+		var name api.RepoName
+		var patterns []string
+		for name, patterns = range missing {
+			break
+		}
+		if len(patterns) == 1 {
+			description = fmt.Sprintf("The repository %s matched by your repo: filter could not be searched because it does not contain the revision %q.", name, patterns[0])
+		} else {
+			description = fmt.Sprintf("The repository %s matched by your repo: filter could not be searched because it has multiple specified revisions: @%s.", name, strings.Join(patterns, ","))
+		}
+	} else {
+		repoRevs := make([]string, 0, len(missing))
+		for name, patterns := range missing {
+			repoRevs = append(repoRevs, string(name)+"@"+strings.Join(patterns, ","))
+		}
+		description = fmt.Sprintf("%d repositories matched by your repo: filter could not be searched because the following revisions do not exist, or differ but were specified for the same repository: %s.", len(missing), strings.Join(repoRevs, ", "))
+	}
+	return &searchAlert{
+		title:       "Some repositories could not be searched",
+		description: description,
+	}
 }
 
 // createListFunc returns a list function for query.ExpandRepo based on
@@ -324,4 +354,73 @@ func (s *searchContext) CacheRepo(repos ...*types.Repo) {
 		s.repos[r.Name] = r
 	}
 	s.mu.Unlock()
+}
+
+// SearchProviders contains instances of our search providers.
+type SearchProviders struct {
+	// Text is our root text searcher.
+	Text *backend.Text
+
+	// SearcherURLs is an endpoint map to our searcher service replicas.
+	//
+	// Note: This field will be removed once we have removed our old search
+	// code paths.
+	SearcherURLs *endpoint.Map
+
+	// Index is a search.Searcher for Zoekt.
+	Index *backend.Zoekt
+}
+
+var (
+	zoektAddr   = env.Get("ZOEKT_HOST", "indexed-search:80", "host:port of the zoekt instance")
+	searcherURL = env.Get("SEARCHER_URL", "k8s+http://searcher:3181", "searcher server URL")
+
+	searchOnce sync.Once
+	searchP    *SearchProviders
+)
+
+// Search returns instances of our search providers.
+func Search() *SearchProviders {
+	searchOnce.Do(func() {
+		// Zoekt
+		index := &backend.Zoekt{}
+		if zoektAddr != "" {
+			index.Client = zoektrpc.Client(zoektAddr)
+		}
+		go func() {
+			conf.Watch(func() {
+				index.SetEnabled(conf.SearchIndexEnabled())
+			})
+		}()
+
+		// Searcher
+		var searcherURLs *endpoint.Map
+		if searcherURL == "" {
+			searcherURLs = endpoint.Empty(errors.New("a searcher service has not been configured"))
+		} else {
+			searcherURLs = endpoint.New(searcherURL)
+		}
+
+		text := &backend.Text{
+			Index: index,
+			Fallback: &backend.TextJIT{
+				Endpoints: searcherURLs,
+				Resolve: func(ctx context.Context, name api.RepoName, spec string) (api.CommitID, error) {
+					// Do not trigger a repo-updater lookup (e.g.,
+					// backend.{GitRepo,Repos.ResolveRev}) because that would
+					// slow this operation down by a lot (if we're looping
+					// over many repos). This means that it'll fail if a repo
+					// is not on gitserver.
+					return git.ResolveRevision(ctx, gitserver.Repo{Name: name}, nil, spec, &git.ResolveRevisionOptions{NoEnsureRevision: true})
+				},
+			},
+		}
+
+		searchP = &SearchProviders{
+			Text:         text,
+			SearcherURLs: searcherURLs,
+			Index:        index,
+		}
+	})
+	return searchP
 }

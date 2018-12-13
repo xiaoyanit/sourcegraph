@@ -110,8 +110,12 @@ const (
 	RepositoryStatusCloning RepositoryStatusType = "cloning"
 
 	// RepositoryStatusMissing indicates the search failed for the repository
-	// since the repository or commit does not exist.
+	// since the repository does not exist.
 	RepositoryStatusMissing RepositoryStatusType = "missing"
+
+	// RepositoryStatusCommitMissing indicates the search failed for the
+	// repository since the commit does not exist.
+	RepositoryStatusCommitMissing RepositoryStatusType = "commitmissing"
 
 	// RepositoryStatusError indicates the search failed for the repository
 	// due to an unexpected error. Implementations of Searcher should not use
