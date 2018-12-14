@@ -76,7 +76,7 @@ require (
 	github.com/mattn/goreman v0.2.1-0.20180930133601-738cf1257bd3
 	github.com/microcosm-cc/bluemonday v1.0.1
 	github.com/neelance/parallel v0.0.0-20160708114440-4de9ce63d14c
-	github.com/opentracing-contrib/go-stdlib v0.0.0-20180702182724-07a764486eb1
+	github.com/opentracing-contrib/go-stdlib v0.0.0-20181214210840-09659152d0aa
 	github.com/opentracing/opentracing-go v1.0.2
 	github.com/peterh/liner v1.1.0 // indirect
 	github.com/peterhellberg/link v1.0.0
